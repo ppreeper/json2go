@@ -2,120 +2,311 @@
 import argparse
 import json
 import sys
-import time
+import datetime
+import re
+from dataclasses import dataclass
+
+MAX_DEPTH = 128
 
 
-def gettype(value: any, buf: str, omit: bool, level: int) -> str:
-    typevalue = type(value)
-    if typevalue == str:
-        try:
-            time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
-            return "time.Time"
-        except ValueError:
-            return "string"
-    elif typevalue == int:
-        return "int"
-    elif typevalue == float:
-        return "float64"
-    elif typevalue == bool:
-        return "bool"
-    elif typevalue == list:
-        list_type = ""
-        if value:
-            list_type = gettype(value[0], buf, omit, level)
-        return "[]" + list_type
-    elif typevalue == dict:
-        struct_text = itermap(value, buf, omit, level=level + 1) + level * buf + "}"
-        level = level - 1
-        return struct_text
-    elif value is None:
+@dataclass
+class Config:
+    """Shared options threaded through the recursive type-building functions."""
+
+    buf: str
+    omit: bool
+
+
+def unify_types(types: list[str]) -> str:
+    """Pick a single Go type that fits all entries in *types*.
+
+    Returns 'any' when the types are incompatible.
+    """
+    if not types:
         return "any"
-    else:
-        return ""
+    # preserve order but unique
+    unique: list[str] = []
+    for t in types:
+        if t not in unique:
+            unique.append(t)
+    if len(unique) == 1:
+        return unique[0]
+    if "any" in unique:
+        return "any"
+    s = set(unique)
+    # numeric: int + float -> float64
+    if s <= {"int", "float64"}:
+        return "float64" if "float64" in s else "int"
+    # slices: unify inner types
+    if all(t.startswith("[]") for t in unique):
+        inner = [t[2:] for t in unique]
+        return "[]" + unify_types(inner)
+    # structs: keep only if identical
+    if all(t.startswith("struct") for t in unique):
+        if len(s) == 1:
+            return unique[0]
+        return "any"
+    return "any"
 
 
-def getdef(key: str, value: any, buf: str, omit: bool, level: int) -> str:
-    name = key.title().replace("_", "")
-    name = (
-        name.replace("Url", "URL")
-        .replace("Id", "ID")
-        .replace("Api", "API")
-        .replace("Html", "HTML")
-        .replace("Ssh", "SSH")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def _is_datetime_string(s: str) -> bool:
+    """Return True when *s* looks like a date/datetime string."""
+    # Quick reject: must be at least YYYY-MM-DD (10 chars) and start with
+    # a digit pattern that looks like a date.
+    if len(s) < 10 or not _DATE_RE.match(s):
+        return False
+    try:
+        datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return True
+    except ValueError:
+        pass
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+    ):
+        try:
+            datetime.datetime.strptime(s, fmt)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def unified_type_for_values(
+    values: list, cfg: Config, level: int
+) -> str:
+    """Given raw Python values for one key, return a unified Go type string.
+
+    * All dicts  -> merge fields into one struct.
+    * All lists  -> flatten inner values and recurse.
+    * Otherwise  -> per-value gettype + unify_types.
+    """
+    if not values:
+        return "any"
+    non_none = [v for v in values if v is not None]
+    if not non_none:
+        return "any"
+    # All dicts -> merge fields into one struct
+    dicts = [v for v in non_none if isinstance(v, dict)]
+    if dicts and len(dicts) == len(non_none):
+        return merged_struct_type(dicts, cfg, level)
+    # All lists -> flatten inner values and unify
+    lists = [v for v in non_none if isinstance(v, list)]
+    if lists and len(lists) == len(non_none):
+        all_inner: list = []
+        for lst in lists:
+            all_inner.extend(lst)
+        return "[]" + unified_type_for_values(all_inner, cfg, level)
+    # Default: per-value gettype + unify
+    types = [gettype(v, cfg, level) for v in values]
+    return unify_types(types)
+
+
+def merged_struct_fields(
+    dicts: list[dict], cfg: Config, level: int
+) -> str:
+    """Build indented struct field lines by merging keys/types across *dicts*.
+
+    Collects every key in first-seen order, then unifies the Go type for each
+    key across all dicts that contain it.  Returns the field lines only
+    (without the surrounding ``struct { }``).
+    """
+    all_keys: list[str] = []
+    seen: set[str] = set()
+    for d in dicts:
+        for k in d:
+            if k not in seen:
+                all_keys.append(k)
+                seen.add(k)
+
+    indent = cfg.buf * level
+    parts: list[str] = []
+    used_names: dict[str, int] = {}
+    for k in all_keys:
+        vals = [d[k] for d in dicts if k in d]
+        unified = unified_type_for_values(vals, cfg, level)
+        name = to_exported_name(k)
+        # Deduplicate: append a numeric suffix on collision
+        if name in used_names:
+            used_names[name] += 1
+            name = f"{name}{used_names[name]}"
+        else:
+            used_names[name] = 1
+        tag = f'`json:"{k},omitempty"`' if cfg.omit else f'`json:"{k}"`'
+        parts.append(f"{indent}{name} {unified} {tag}")
+    return "\n".join(parts) + "\n" if parts else ""
+
+
+def merged_struct_type(
+    dicts: list[dict], cfg: Config, level: int
+) -> str:
+    """Build a complete Go ``struct { … }`` type by merging fields across *dicts*."""
+    fields = merged_struct_fields(dicts, cfg, level + 1)
+    return "struct {\n" + fields + cfg.buf * level + "}"
+
+
+def gettype(value: object, cfg: Config, level: int) -> str:
+    """Infer the Go type string for a single Python/JSON value."""
+    if level > MAX_DEPTH:
+        return "any"
+    if isinstance(value, bool):
+        # bool check must precede int because bool is a subclass of int
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float64"
+    if isinstance(value, str):
+        return "time.Time" if _is_datetime_string(value) else "string"
+    if isinstance(value, list):
+        if not value:
+            return "[]any"
+        non_none = [v for v in value if v is not None]
+        if not non_none:
+            return "[]any"
+        dicts = [v for v in non_none if isinstance(v, dict)]
+        if dicts and len(dicts) == len(non_none):
+            return "[]" + merged_struct_type(dicts, cfg, level)
+        types = [gettype(v, cfg, level) for v in value]
+        return "[]" + unify_types(types)
+    if isinstance(value, dict):
+        return merged_struct_type([value], cfg, level)
+    if value is None:
+        return "any"
+    return "any"
+
+
+# Well-known Go acronyms (lowered for lookup).
+_ACRONYMS: dict[str, str] = {
+    a.lower(): a
+    for a in (
+        "ACL", "API", "ASCII", "CPU", "CSS", "DNS", "EOF", "GID", "GUID",
+        "HTML", "HTTP", "HTTPS", "ID", "IP", "JSON", "LHS", "QPS", "RAM",
+        "RHS", "RPC", "SLA", "SMTP", "SQL", "SSH", "SSL", "TCP", "TLS",
+        "TTL", "UDP", "UID", "URI", "URL", "UUID", "VM", "XML", "XMPP",
+        "XSRF", "XSS",
     )
-    return " ".join(
-        [
-            name,
-            gettype(value, buf, omit, level),
-            f'`json:"{key},omitempty"`' if omit else f'`json:"{key}"`',
-        ]
-    )
+}
+
+# Split on non-alphanumerics.
+_DELIM_RE = re.compile(r"[^0-9a-zA-Z]+")
+
+# Insert a boundary between lower→upper (e.g. "userId" → "user_Id") and
+# between a run of uppercase and the next titlecase word (e.g. "HTMLBody"
+# → "HTML_Body").
+_CAMEL_RE1 = re.compile(r"([a-z0-9])([A-Z])")
+_CAMEL_RE2 = re.compile(r"([A-Z]+)([A-Z][a-z])")
 
 
-def itermap(data: any, buf: str, omit: bool, level: int) -> str:
-    struct_text = ""
-    if type(data) == list and data:
-        struct_text += " []struct {\n"
-        for key, value in data[0].items():
-            struct_text += buf * level + getdef(key, value, buf, omit, level) + "\n"
-    elif type(data) == dict:
+def to_exported_name(key: str) -> str:
+    """Convert a JSON key into a Go exported field name.
 
-        struct_text += " struct {\n"
-        for key, value in data.items():
-            struct_text += buf * level + getdef(key, value, buf, omit, level) + "\n"
-    return struct_text
+    Splits on non-alphanumeric characters *and* camelCase boundaries, then
+    title-cases each segment, mapping well-known abbreviations to their
+    canonical uppercase forms.
+    Falls back to ``Field`` when the key contains no usable characters.
+    """
+    out: list[str] = []
+    for segment in _DELIM_RE.split(key):
+        if not segment:
+            continue
+        # Break camelCase within each segment.
+        expanded = _CAMEL_RE2.sub(r"\1_\2", _CAMEL_RE1.sub(r"\1_\2", segment))
+        for word in expanded.split("_"):
+            if not word:
+                continue
+            low = word.lower()
+            if low in _ACRONYMS:
+                out.append(_ACRONYMS[low])
+            else:
+                out.append(word[:1].upper() + word[1:])
+    return "".join(out) if out else "Field"
+
+
+def itermap(data: object, cfg: Config, level: int) -> str:
+    """Return the top-level type body (`` struct {\\n…`` or `` []struct {\\n…``).
+
+    The caller is responsible for appending the closing ``}``.
+    """
+    if isinstance(data, list) and data:
+        dicts = [d for d in data if isinstance(d, dict)]
+        if dicts:
+            fields = merged_struct_fields(dicts, cfg, level)
+            return " []struct {\n" + fields
+    elif isinstance(data, dict):
+        fields = merged_struct_fields([data], cfg, level)
+        return " struct {\n" + fields
+    return ""
 
 
 class ArgParser(argparse.ArgumentParser):
-    """ArgParser modified to output help on error"""
+    """ArgumentParser subclass that prints help on error."""
 
-    def error(self, message):
+    def error(self, message: str) -> None:
         sys.stderr.write(f"error: {message}\n")
         self.print_help()
         sys.exit(2)
 
 
-def main():
+def main() -> None:
     parser = ArgParser(
         prog="json2go",
         description="convert json to go structs",
         epilog="thanks for using %(prog)s!",
     )
     parser.add_argument(
-        "-i",
-        "--input",
+        "-i", "--input",
         help="file: <file.json> or stdin: -",
         type=argparse.FileType("r"),
-        default="-",
+        default=sys.stdin,
     )
     parser.add_argument(
-        "-b", "--buffer", help="indent text", action="store", default="    "
+        "-b", "--buffer",
+        help="indent text",
+        action="store",
+        default="    ",
     )
     parser.add_argument(
-        "-n", "--name", help="struct name", action="store", default="AutoGenerated"
+        "-n", "--name",
+        help="struct name",
+        action="store",
+        default="AutoGenerated",
     )
     parser.add_argument(
-        "-o", "--omit", help="add omitempty", action="store_true", default=False
+        "-o", "--omit",
+        help="add omitempty",
+        action="store_true",
+        default=False,
     )
     args = parser.parse_args(args=None if sys.argv[1:] else ["-h"])
 
-    if args.input.name == "-":
-        # Read from stdin
-        json_data = json.load(sys.stdin.read())
+    try:
+        json_data = json.load(args.input)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"error: invalid JSON: {e}\n")
+        sys.exit(2)
+    except Exception as e:
+        sys.stderr.write(f"error: could not read input: {e}\n")
+        sys.exit(2)
+
+    cfg = Config(buf=args.buffer, omit=args.omit)
+    struct_body = itermap(json_data, cfg, level=1)
+
+    if struct_body:
+        # Top-level is a dict or array-of-dicts -> full struct output
+        out = f"type {args.name}{struct_body}}}\n"
     else:
-        # Read from a file
-        with args.input as f:
-            json_data = json.load(f)
+        # Top-level is a scalar or primitive array -> emit a type alias
+        out = f"type {args.name} {gettype(json_data, cfg, level=0)}\n"
 
-    level = 0
-    buf = args.buffer
-
-    print(
-        "type "
-        + args.name
-        + itermap(json_data, buf, args.omit, level=level + 1)
-        + "}\n"
-    )
+    if "time.Time" in out:
+        print('import "time"\n')
+    print(out)
 
 
 if __name__ == "__main__":
